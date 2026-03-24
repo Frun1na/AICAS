@@ -1,0 +1,24 @@
+{
+  "device": "cuda",
+  "dtype": "fp16",
+  "gpu_name": "NVIDIA GeForce RTX 3070 Laptop GPU",
+  "seed": 0,
+  "prefill": {
+    "triton_ms": 0.3313995501230238,
+    "reference_ms": 0.2601602998765884,
+    "speedup": 0.785035163083385,
+    "max_abs_err": 0.00048828125
+  },
+  "decode": {
+    "triton_ms": 0.47686779998912243,
+    "reference_ms": 0.5140192000908428,
+    "speedup": 1.07790712667655,
+    "max_abs_err": 9.1552734375e-05
+  },
+  "vision_varlen": {
+    "triton_ms": 0.8645099500427023,
+    "reference_ms": 0.5015891500079306,
+    "speedup": 0.5802005517497568,
+    "max_abs_err": 0.000244140625
+  }
+}
