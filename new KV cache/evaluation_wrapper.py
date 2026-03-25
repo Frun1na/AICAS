@@ -140,81 +140,73 @@ def _dequantize_kivi_value_chunk(quantized: dict, device: torch.device, dtype: t
     return restored.contiguous()
 
 
-def _append_to_gpu_chunk_cache(module, key_states: torch.Tensor, value_states: torch.Tensor):
+def _append_to_paged_kv_cache(module, key_states: torch.Tensor, value_states: torch.Tensor):
     """
-    Keep per-layer KV cache on GPU using:
-    - KIVI-style quantized old blocks
+    Keep per-layer KV cache in paged form using:
+    - KIVI-style 2-bit quantized pages
+    - packed uint8 storage
     - a page table for external fragmentation management
-    - a recent full-precision residual window
     """
     if getattr(module, "_kv_quant_blocks", None) is None:
         module._kv_quant_blocks = []
         module._kv_page_table = []
-        module._kv_residual_key = None
-        module._kv_residual_value = None
+        module._kv_page_buffer_key = None
+        module._kv_page_buffer_value = None
         module._kv_next_logical_page = 0
 
-    residual_key = getattr(module, "_kv_residual_key", None)
-    residual_value = getattr(module, "_kv_residual_value", None)
-    if residual_key is None:
-        residual_key = key_states.detach().contiguous()
-        residual_value = value_states.detach().contiguous()
+    buffer_key = getattr(module, "_kv_page_buffer_key", None)
+    buffer_value = getattr(module, "_kv_page_buffer_value", None)
+    if buffer_key is None:
+        buffer_key = key_states.detach().contiguous()
+        buffer_value = value_states.detach().contiguous()
     else:
-        residual_key = torch.cat([residual_key, key_states.detach()], dim=-2).contiguous()
-        residual_value = torch.cat([residual_value, value_states.detach()], dim=-2).contiguous()
+        buffer_key = torch.cat([buffer_key, key_states.detach()], dim=-2).contiguous()
+        buffer_value = torch.cat([buffer_value, value_states.detach()], dim=-2).contiguous()
 
-    chunk_size = max(1, getattr(module, "_gpu_kv_chunk_size", 256))
-    residual_length = max(1, getattr(module, "_gpu_kv_residual_length", 128))
     group_size = max(1, getattr(module, "_gpu_kv_quant_group_size", 32))
     page_size = max(1, getattr(module, "_gpu_kv_page_size", 64))
 
-    while residual_key.shape[-2] > residual_length:
-        flush_len = min(chunk_size, residual_key.shape[-2] - residual_length)
-        key_chunk = residual_key[:, :, :flush_len, :].contiguous()
-        value_chunk = residual_value[:, :, :flush_len, :].contiguous()
-        for start in range(0, flush_len, page_size):
-            end = min(start + page_size, flush_len)
-            page_key = key_chunk[:, :, start:end, :].contiguous()
-            page_value = value_chunk[:, :, start:end, :].contiguous()
+    while buffer_key.shape[-2] >= page_size:
+        page_key = buffer_key[:, :, :page_size, :].contiguous()
+        page_value = buffer_value[:, :, :page_size, :].contiguous()
 
-            quant_key = _quantize_kivi_key_chunk(page_key, group_size)
-            quant_value = _quantize_kivi_value_chunk(page_value, group_size)
+        quant_key = _quantize_kivi_key_chunk(page_key, group_size)
+        quant_value = _quantize_kivi_value_chunk(page_value, group_size)
 
-            block_id = len(module._kv_quant_blocks)
-            module._kv_quant_blocks.append(
-                {
-                    "key": quant_key,
-                    "value": quant_value,
-                    "valid_tokens": end - start,
-                }
-            )
-            module._kv_page_table.append(
-                {
-                    "logical_page_id": module._kv_next_logical_page,
-                    "block_id": block_id,
-                }
-            )
-            module._kv_next_logical_page += 1
+        block_id = len(module._kv_quant_blocks)
+        module._kv_quant_blocks.append(
+            {
+                "key": quant_key,
+                "value": quant_value,
+                "valid_tokens": page_size,
+            }
+        )
+        module._kv_page_table.append(
+            {
+                "logical_page_id": module._kv_next_logical_page,
+                "block_id": block_id,
+            }
+        )
+        module._kv_next_logical_page += 1
+        buffer_key = buffer_key[:, :, page_size:, :].contiguous()
+        buffer_value = buffer_value[:, :, page_size:, :].contiguous()
 
-        residual_key = residual_key[:, :, flush_len:, :].contiguous()
-        residual_value = residual_value[:, :, flush_len:, :].contiguous()
-
-    module._kv_residual_key = residual_key
-    module._kv_residual_value = residual_value
+    module._kv_page_buffer_key = buffer_key
+    module._kv_page_buffer_value = buffer_value
 
 
-def _gather_gpu_chunk_cache(module):
+def _gather_paged_kv_cache(module):
     quant_blocks = getattr(module, "_kv_quant_blocks", None) or []
     page_table = getattr(module, "_kv_page_table", None) or []
-    residual_key = getattr(module, "_kv_residual_key", None)
-    residual_value = getattr(module, "_kv_residual_value", None)
+    page_buffer_key = getattr(module, "_kv_page_buffer_key", None)
+    page_buffer_value = getattr(module, "_kv_page_buffer_value", None)
 
     key_tensors = []
     value_tensors = []
 
-    if residual_key is not None:
-        device = residual_key.device
-        dtype = residual_key.dtype
+    if page_buffer_key is not None:
+        device = page_buffer_key.device
+        dtype = page_buffer_key.dtype
     elif quant_blocks:
         device = quant_blocks[0]["key"]["packed"].device
         dtype = torch.float16
@@ -230,9 +222,9 @@ def _gather_gpu_chunk_cache(module):
             key_tensors.append(block_key[:, :, :valid_tokens, :])
             value_tensors.append(block_value[:, :, :valid_tokens, :])
 
-    if residual_key is not None and residual_value is not None:
-        key_tensors.append(residual_key)
-        value_tensors.append(residual_value)
+    if page_buffer_key is not None and page_buffer_value is not None:
+        key_tensors.append(page_buffer_key)
+        value_tensors.append(page_buffer_value)
 
     if not key_tensors or not value_tensors:
         return None, None
@@ -247,13 +239,13 @@ def _populate_custom_cache_from_original(
 ):
     module._kv_quant_blocks = []
     module._kv_page_table = []
-    module._kv_residual_key = None
-    module._kv_residual_value = None
+    module._kv_page_buffer_key = None
+    module._kv_page_buffer_value = None
     module._kv_next_logical_page = 0
-    _append_to_gpu_chunk_cache(module, key_states, value_states)
+    _append_to_paged_kv_cache(module, key_states, value_states)
 
 
-def _chunked_gpu_attention(
+def _paged_kv_attention(
     module,
     query_states: torch.Tensor,
     key_cache: torch.Tensor,
@@ -261,7 +253,7 @@ def _chunked_gpu_attention(
     attention_mask: torch.Tensor = None,
 ):
     """
-    Compute attention from chunked KV cache stored on GPU.
+    Compute attention from paged KV cache stored on GPU.
     """
     key_states = _repeat_kv(key_cache, module.num_key_value_groups)
     value_states = _repeat_kv(value_cache, module.num_key_value_groups)
@@ -339,9 +331,9 @@ def _build_swiftkv_decoder_layer_forward(original_forward):
     return patched_forward
 
 
-def _build_chunked_gpu_forward(original_forward):
+def _build_paged_kv_forward(original_forward):
     """
-    Build a conservative attention forward that applies chunked GPU KV cache.
+    Build a conservative attention forward that applies paged KV cache.
 
     If the runtime module shape or helper functions differ from expectation,
     we fall back to the original implementation.
@@ -436,13 +428,13 @@ def _build_chunked_gpu_forward(original_forward):
             if decode_seq_len > 1:
                 self._kv_quant_blocks = []
                 self._kv_page_table = []
-                self._kv_residual_key = None
-                self._kv_residual_value = None
+                self._kv_page_buffer_key = None
+                self._kv_page_buffer_value = None
                 self._kv_next_logical_page = 0
                 self._kv_decode_step = 0
-                _append_to_gpu_chunk_cache(self, key_states, value_states)
+                _append_to_paged_kv_cache(self, key_states, value_states)
 
-                key_cache, value_cache = _gather_gpu_chunk_cache(self)
+                key_cache, value_cache = _gather_paged_kv_cache(self)
                 if key_cache is None or value_cache is None:
                     return _call_original(
                         hidden_states, position_embeddings, attention_mask, past_key_values, kwargs
@@ -479,16 +471,16 @@ def _build_chunked_gpu_forward(original_forward):
                 _populate_custom_cache_from_original(self, key_states, value_states)
                 self._kv_decode_step += decode_seq_len
             else:
-                _append_to_gpu_chunk_cache(self, key_states, value_states)
+                _append_to_paged_kv_cache(self, key_states, value_states)
                 self._kv_decode_step += decode_seq_len
 
-            key_cache, value_cache = _gather_gpu_chunk_cache(self)
+            key_cache, value_cache = _gather_paged_kv_cache(self)
             if key_cache is None or value_cache is None:
                 return _call_original(
                     hidden_states, position_embeddings, attention_mask, past_key_values, kwargs
                 )
 
-            attn_output, attn_weights = _chunked_gpu_attention(
+            attn_output, attn_weights = _paged_kv_attention(
                 self,
                 query_states,
                 key_cache,
@@ -507,7 +499,7 @@ def _build_chunked_gpu_forward(original_forward):
     return patched_forward
 
 
-def _reset_chunked_gpu_kv_cache(model):
+def _reset_paged_kv_cache(model):
     text_model = getattr(model, "model", None)
     layers = getattr(text_model, "layers", None)
     if layers is None:
@@ -521,10 +513,10 @@ def _reset_chunked_gpu_kv_cache(model):
             self_attn._kv_quant_blocks = []
         if hasattr(self_attn, "_kv_page_table"):
             self_attn._kv_page_table = []
-        if hasattr(self_attn, "_kv_residual_key"):
-            self_attn._kv_residual_key = None
-        if hasattr(self_attn, "_kv_residual_value"):
-            self_attn._kv_residual_value = None
+        if hasattr(self_attn, "_kv_page_buffer_key"):
+            self_attn._kv_page_buffer_key = None
+        if hasattr(self_attn, "_kv_page_buffer_value"):
+            self_attn._kv_page_buffer_value = None
         if hasattr(self_attn, "_kv_next_logical_page"):
             self_attn._kv_next_logical_page = 0
         if hasattr(self_attn, "_kv_decode_step"):
@@ -533,11 +525,11 @@ def _reset_chunked_gpu_kv_cache(model):
 
 def _build_resetting_generate(original_generate):
     """
-    Clear chunked GPU KV cache before every generation call.
+    Clear paged KV cache before every generation call.
     """
 
     def patched_generate(self, *args, **kwargs):
-        _reset_chunked_gpu_kv_cache(self)
+        _reset_paged_kv_cache(self)
         return original_generate(*args, **kwargs)
 
     return patched_generate
@@ -726,8 +718,8 @@ class VLMModel:
         if hasattr(self._model, "generation_config"):
             self._model.generation_config.use_cache = True
 
-        if not hasattr(self._model, "_original_generate_for_chunked_gpu_kv"):
-            self._model._original_generate_for_chunked_gpu_kv = self._model.generate
+        if not hasattr(self._model, "_original_generate_for_paged_kv"):
+            self._model._original_generate_for_paged_kv = self._model.generate
             self._model.generate = types.MethodType(
                 _build_resetting_generate(self._model.generate),
                 self._model,
@@ -759,33 +751,31 @@ class VLMModel:
 
                 self_attn._kv_quant_blocks = []
                 self_attn._kv_page_table = []
-                self_attn._kv_residual_key = None
-                self_attn._kv_residual_value = None
+                self_attn._kv_page_buffer_key = None
+                self_attn._kv_page_buffer_value = None
                 self_attn._kv_next_logical_page = 0
                 self_attn._kv_decode_step = 0
                 self_attn._kv_start_after_tokens = 4
-                self_attn._gpu_kv_chunk_size = 256
                 self_attn._gpu_kv_page_size = 64
-                self_attn._gpu_kv_residual_length = 128
                 self_attn._gpu_kv_quant_group_size = 32
                 self_attn._prefill_quoka_top_k = 128
 
-                if hasattr(self_attn, "_original_forward_for_chunked_gpu_kv"):
+                if hasattr(self_attn, "_original_forward_for_paged_kv"):
                     continue
 
-                self_attn._original_forward_for_chunked_gpu_kv = self_attn.forward
+                self_attn._original_forward_for_paged_kv = self_attn.forward
                 self_attn.forward = types.MethodType(
-                    _build_chunked_gpu_forward(self_attn.forward),
+                    _build_paged_kv_forward(self_attn.forward),
                     self_attn,
                 )
                 patched_layers += 1
 
         if patched_layers > 0:
             print(
-                f"[VLMModel] Applied custom KIVI-style chunked KV cache "
+                f"[VLMModel] Applied custom paged KIVI-style KV cache "
                 f"to {patched_layers} layers "
-                f"(chunk size = 256, page size = 64, residual = 128, group size = 32, "
-                f"2-bit quantized KV, page table, GPU-only storage and attention, "
+                f"(page size = 64, group size = 32, "
+                f"2-bit quantized KV, packed uint8 storage, page table, "
                 f"QUOKA-style prefill top-k attention by cosine similarity, "
                 f"custom decoder KV starts after 4 decode tokens)"
             )
