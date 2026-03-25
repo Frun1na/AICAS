@@ -1,4 +1,4 @@
-﻿"""
+"""
 AICAS 2026 - Participant Core Modification File
 
 Participants should modify the VLMModel class to implement optimizations.
@@ -225,6 +225,20 @@ class CUDAGraphDecodeRunner:
         self.capture_failed = False
         self._mask_visible_len = 0
 
+    def _has_compatible_step_shapes(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        cache_position: torch.Tensor,
+    ) -> bool:
+        if not isinstance(input_ids, torch.Tensor) or tuple(input_ids.shape) != tuple(self.static_input_ids.shape):
+            return False
+        if not isinstance(position_ids, torch.Tensor) or tuple(position_ids.shape) != tuple(self.static_position_ids.shape):
+            return False
+        if not isinstance(cache_position, torch.Tensor) or cache_position.numel() != int(self.static_cache_position.numel()):
+            return False
+        return True
+
     def load_prefix(self, past_key_values, prefix_len: int) -> bool:
         if not self.graph_cache.load_from_existing(past_key_values):
             return False
@@ -336,6 +350,8 @@ class CUDAGraphDecodeRunner:
         if self.capture_failed:
             return False
         if not torch.cuda.is_available():
+            return False
+        if not self._has_compatible_step_shapes(input_ids, position_ids, cache_position):
             return False
         if not self.load_prefix(past_key_values, prefix_len):
             self.capture_failed = True
@@ -1495,6 +1511,55 @@ class VLMModel:
         base_position_ids = base_position_ids.add(delta)
         return base_position_ids.unsqueeze(0).expand(3, -1, -1)
 
+    def _normalize_single_token_cache_position(
+        self,
+        past_key_values,
+        cache_position,
+        device,
+    ):
+        normalized_cache_position = None
+        prefix_cache_len = None
+
+        if past_key_values is not None:
+            try:
+                prefix_cache_len = int(past_key_values.get_seq_length())
+            except Exception:
+                prefix_cache_len = None
+
+        if prefix_cache_len is not None and prefix_cache_len >= 0:
+            normalized_cache_position = torch.tensor(
+                [prefix_cache_len],
+                dtype=torch.long,
+                device=device,
+            )
+            return normalized_cache_position, prefix_cache_len
+
+        if isinstance(cache_position, torch.Tensor) and cache_position.numel() > 0:
+            normalized_cache_position = cache_position.to(device=device, dtype=torch.long).view(-1)
+            if normalized_cache_position.numel() == 1:
+                return normalized_cache_position.clone(), int(normalized_cache_position.item())
+            return normalized_cache_position[-1:].clone().add_(1), int(normalized_cache_position[-1].item()) + 1
+
+        return None, 0
+
+    def _is_single_token_decode_state(self, entry) -> bool:
+        if entry is None:
+            return False
+
+        first_token = entry.get("first_token")
+        cache_position = entry.get("cache_position")
+        position_ids = entry.get("position_ids")
+
+        if not isinstance(first_token, torch.Tensor) or first_token.ndim != 2 or first_token.shape != (1, 1):
+            return False
+        if not isinstance(cache_position, torch.Tensor) or cache_position.numel() != 1:
+            return False
+        if not isinstance(position_ids, torch.Tensor) or position_ids.ndim != 3:
+            return False
+        if position_ids.shape[0] != 3 or position_ids.shape[1] != first_token.shape[0] or position_ids.shape[2] != 1:
+            return False
+        return True
+
     def _attention_mask_is_all_ones(self, attention_mask) -> bool:
         if attention_mask is None:
             return True
@@ -1666,21 +1731,23 @@ class VLMModel:
 
         first_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
         attention_mask = updated_kwargs.get("attention_mask")
-        prefix_cache_len = 0
-        try:
-            prefix_cache_len = int(past_key_values.get_seq_length())
-        except Exception:
-            prefix_cache_len = 0
+        normalized_cache_position, prefix_cache_len = self._normalize_single_token_cache_position(
+            past_key_values=past_key_values,
+            cache_position=cache_position,
+            device=first_token.device,
+        )
+        if normalized_cache_position is None:
+            return
         self._prefill_reuse_entry = {
             "key": capture_state["key"],
             "past_key_values": past_key_values,
-            "cache_position": cache_position.clone(),
+            "cache_position": normalized_cache_position,
             "attention_mask": None if attention_mask is None else attention_mask.clone(),
             "attention_mask_is_all_ones": self._attention_mask_is_all_ones(attention_mask),
             "first_token": first_token.clone(),
             "prefix_cache_len": prefix_cache_len,
             "position_ids": self._build_decode_position_ids_from_cache_position(
-                cache_position=cache_position,
+                cache_position=normalized_cache_position,
                 batch_size=first_token.shape[0],
                 device=first_token.device,
             ),
@@ -1712,9 +1779,7 @@ class VLMModel:
     def _can_use_direct_prefill_reuse_decode(self, entry) -> bool:
         if not self._runtime_config.get("prefill_reuse_direct_lm_decode", False):
             return False
-        if entry is None:
-            return False
-        if entry.get("position_ids") is None:
+        if not self._is_single_token_decode_state(entry):
             return False
         return bool(entry.get("attention_mask_is_all_ones", False))
 
